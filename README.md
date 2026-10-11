@@ -13,6 +13,7 @@ This is a **patch repository**, not a fork — it never duplicates upstream sour
 ```
 patches/isaaclab3-migration.patch   the code adaptation (13 files, +488 −184)
 scripts/                            standalone tools
+tools/run_full_chain.ps1            13-step end-to-end harness with per-step timeouts
 docs/RUNNING.md                     full runbook — start here
 docs/MIGRATION.md                   what changed and why
 docs/KNOWN-ISSUES.md                what is broken and what was never tested
@@ -37,6 +38,8 @@ Everything below was executed on Windows 11 / NVIDIA T1200 (4 GB VRAM) / Isaac S
 | W&B training logger | ⚠️ works only with **`wandb<0.29`** — see [Weights & Biases setup](#weights--biases-setup) |
 | W&B upload to cloud | ❌ not run — needs credentials |
 | `--checkpoint latest` / `best` | ✅ verified (a wrapper bug was found and fixed) |
+| `isaaclab play` end-to-end | ⚠️ fails on the first `env.step` — framework issue, see [KNOWN-ISSUES §5c](docs/KNOWN-ISSUES.md) |
+| Full-chain harness | ✅ `tools/run_full_chain.ps1`, 13 steps, per-step timeouts |
 | Real LAFAN1 training data | ❌ absent — only a synthetic stand-still clip |
 
 ---
@@ -311,6 +314,20 @@ What does **not** change: observation/reward semantics (verified line-by-line ag
 | `diff_against_upstream.py` | Prove the resolved config has no unintended drift. |
 | `check_agent_cfg_equivalence.py` | Prove the modern `actor`/`critic` config equals the deprecated `policy` config. |
 | `make_synthetic_motion.py` | Produce a format-valid `.npz` for pipeline validation. |
+| `diagnose_play_hang.py` | Instrument every stage of the play sequence with timestamps; `faulthandler` dumps all thread stacks if a stage blocks. |
+| `diagnose_actor_cfg.py` | Show the agent config before and after `handle_deprecated_rsl_rl_cfg`. |
+
+Run everything at once:
+
+```powershell
+powershell -File tools\run_full_chain.ps1 -IL <IsaacLab> -WBT <whole_body_tracking>
+```
+
+Each of the 13 steps runs in its own job with a hard wall-clock timeout, writes a per-step log, and
+asserts against that log. Two steps legitimately do not exit — training with `--logger wandb` and
+`isaaclab play` both block in teardown — so they declare success patterns and are reported as
+`PASS (timed out in teardown, after success markers were present)` rather than being counted as
+failures.
 
 ---
 

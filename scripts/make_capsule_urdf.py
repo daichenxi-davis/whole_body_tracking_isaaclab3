@@ -28,11 +28,12 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import re
 import sys
 
-DEFAULT_URDF = os.path.join(
+_RELATIVE_URDF = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "..",
     "source",
@@ -44,6 +45,60 @@ DEFAULT_URDF = os.path.join(
     "g1",
     "main.urdf",
 )
+
+
+def _candidate_urdfs() -> list[tuple[str, str]]:
+    """Return ``(path, where-it-came-from)`` candidates for the G1 URDF, most reliable first.
+
+    This script lives in the adapter repository, which is separate from the patched upstream
+    checkout, so the URDF cannot be found by a path relative to the script alone. Resolution order:
+
+    1. ``WBT_SOURCE`` — the same variable the other tools use, pointing at
+       ``<upstream>/source/whole_body_tracking``.
+    2. The installed ``whole_body_tracking`` package (an editable install resolves to the checkout).
+    3. A path relative to this script, for the layout where the adapter was copied into the upstream
+       repository.
+    """
+    candidates: list[tuple[str, str]] = []
+    suffix = os.path.join("whole_body_tracking", "assets", "unitree_description", "urdf", "g1", "main.urdf")
+
+    source = os.environ.get("WBT_SOURCE")
+    if source:
+        candidates.append((os.path.join(source, suffix), "WBT_SOURCE"))
+
+    try:
+        spec = importlib.util.find_spec("whole_body_tracking")
+        if spec is not None and spec.origin:
+            package_dir = os.path.dirname(os.path.abspath(spec.origin))
+            candidates.append((os.path.join(package_dir, "assets", "unitree_description", "urdf", "g1", "main.urdf"), "installed package"))
+    except (ImportError, ValueError):
+        pass
+
+    candidates.append((_RELATIVE_URDF, "path relative to this script"))
+    return candidates
+
+
+def resolve_urdf(explicit: str | None) -> str:
+    """Resolve the source URDF path, raising a helpful error when none of the candidates exist."""
+    if explicit:
+        path = os.path.abspath(explicit)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"--urdf path does not exist: {path}")
+        return path
+
+    tried: list[str] = []
+    for path, origin in _candidate_urdfs():
+        path = os.path.abspath(path)
+        tried.append(f"  [{origin}] {path}")
+        if os.path.isfile(path):
+            return path
+
+    raise FileNotFoundError(
+        "Could not locate the G1 URDF (main.urdf). Tried:\n"
+        + "\n".join(tried)
+        + "\n\nPass --urdf <path>, or set WBT_SOURCE to the patched upstream source directory, e.g.\n"
+        "  set WBT_SOURCE=<...>\\whole_body_tracking\\source\\whole_body_tracking"
+    )
 
 # Matches one <collision> ... </collision> block (non-greedy, self-closing not used in this URDF).
 _COLLISION_RE = re.compile(r"<collision\b.*?</collision>", re.DOTALL)
@@ -92,8 +147,8 @@ def convert_collision_block(block: str, log: list[str], keep_squat: bool = False
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--urdf", default=os.path.normpath(DEFAULT_URDF), help="Source URDF.")
-    ap.add_argument("--output", default=None, help="Output URDF (default: <source>.with_capsules.urdf).")
+    ap.add_argument("--urdf", default=None, help="Source URDF. Auto-resolved when omitted (see WBT_SOURCE).")
+    ap.add_argument("--output", default=None, help="Output URDF (default: <source>_capsule.urdf).")
     ap.add_argument("--check", action="store_true", help="Report what would change without writing.")
     ap.add_argument(
         "--keep-squat-cylinders",
@@ -102,9 +157,10 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    src = os.path.abspath(args.urdf)
-    if not os.path.isfile(src):
-        print(f"[ERROR] URDF not found: {src}", file=sys.stderr)
+    try:
+        src = resolve_urdf(args.urdf)
+    except FileNotFoundError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
     out = os.path.abspath(args.output) if args.output else src.replace(".urdf", "_capsule.urdf")
 

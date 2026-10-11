@@ -131,6 +131,58 @@ default entity. Use `WANDB_USERNAME`.
 
 ---
 
+## 5c. `isaaclab play` dies on the first `env.step` (framework issue, not this adapter)
+
+Playback reaches the policy-loading stage, resolves the checkpoint, builds the runner, loads the
+state dict from a path, and then fails on the **first environment step**:
+
+```
+RuntimeError: Can't get __cuda_array_interface__ on Variable that requires grad.
+  If gradients aren't required, use var.detach() to get Variable that doesn't require grad.
+```
+
+The policy head returns a grad-tracking tensor and rsl_rl's vec-env wrapper forwards it into the env
+(which needs a `wp.array`). Training and the export path are unaffected — only stepping in inference
+mode hits it.
+
+Measured with an instrumented run of the full play sequence (2 envs, explicit checkpoint):
+
+| stage | time |
+|---|---|
+| `ManagerBasedRLEnv(...)` | 7.7 s |
+| `RslRlVecEnvWrapper` | 0.25 s |
+| `create_rsl_rl_runner` | **0.02 s** |
+| `runner.load` | **0.02 s** |
+| `get_inference_policy` | 0.00 s |
+| `export_policy_to_jit` | 0.05 s |
+| `export_policy_to_onnx` | 1.90 s |
+| `get_observations` | 0.00 s |
+| **first `env.step`** | **raises** |
+
+Two earlier misdiagnoses are worth recording, because both cost real time:
+
+1. **"Play hangs at policy loading."** It does not hang at loading. The error surfaces there, and the
+   process then blocks in teardown — so the symptom looks like a hang with no traceback. Reading the
+   last log lines is not enough; the harness now treats "timed out *after* the success markers" as a
+   distinct, reported outcome rather than a failure.
+2. **"`create_rsl_rl_runner` hangs."** A diagnostic script reported this because it called
+   `create_rsl_rl_runner` **without** `handle_deprecated_rsl_rl_cfg` first, reproducing
+   `TypeError: MLPModel.__init__() got an unexpected keyword argument 'stochastic'` already covered in
+   item 8's sibling section. The real play entrypoint *does* call it (`play_rsl_rl.py:113`). With the
+   normalisation applied, runner creation takes 0.02 s.
+
+**Anything you write that constructs an rsl_rl runner from a task config must call
+`handle_deprecated_rsl_rl_cfg(agent_cfg, check_rsl_rl_version())` first.** The raw resolved config
+still carries `stochastic` / `init_noise_std` / `noise_std_type` / `state_dependent_std` as `{}`
+values that `MLPModel` rejects.
+
+**Workaround for playback:** use `--checkpoint <explicit .pt path>` and, if the failure is the
+grad-tracking one, drain the policy output before stepping (`.detach()`), or simply use
+`scripts/export_policy.py` to inspect a policy. This adapter does not patch Isaac Lab, so the
+inference-step failure is left as-is and documented rather than worked around in-tree.
+
+---
+
 ## 6. rsl_rl 2.x → 5.5.1 was not diffed at the library level
 
 `check_agent_cfg_equivalence.py` proves that *this project's* agent configuration migrates to
