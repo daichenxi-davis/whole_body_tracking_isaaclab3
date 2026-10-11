@@ -73,14 +73,24 @@ from whole_body_tracking.utils.exporter import (  # noqa: E402
 )
 
 
-def _resolve_checkpoint(task: str, agent_cfg, env_cfg, checkpoint: str) -> str:
-    """Resolve a checkpoint selector (``latest``/``best``/path) to a local file path."""
+def _resolve_checkpoint(task: str, agent_cfg, env_cfg, checkpoint: str, agent_entry: str) -> str:
+    """Resolve a checkpoint selector (``latest``/``best``/path) to a local file path.
+
+    Uses the play entrypoint's resolver so selector semantics stay identical to ``isaaclab play``.
+    Two details must match what training wrote, or the ``latest``/``best`` selectors silently find
+    no run at all:
+
+    * ``task`` must be the **namespace-stripped** name, because run manifests store
+      ``normalize_task_name(task)``.
+    * ``agent`` must equal the agent config entry point recorded in the manifest
+      (``rsl_rl_cfg_entry_point`` by default). Leaving it ``None`` makes the manifest metadata
+      comparison reject every run.
+    """
     from isaaclab_rl.entrypoints.backends.play_rsl_rl import _resolve_checkpoint as resolve
+    from isaaclab_rl.entrypoints.common import normalize_task_name
 
     log_root_path = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
-    # The resolver reads ``task`` (published-checkpoint lookup), ``agent`` (run manifest match) and
-    # ``checkpoint`` off the namespace, so mirror what the play entrypoint passes.
-    args = argparse.Namespace(checkpoint=checkpoint, task=task, agent=None)
+    args = argparse.Namespace(checkpoint=checkpoint, task=normalize_task_name(task), agent=agent_entry)
     path = resolve(args, agent_cfg, env_cfg, log_root_path)
     if path is None:
         raise FileNotFoundError(
@@ -91,11 +101,13 @@ def _resolve_checkpoint(task: str, agent_cfg, env_cfg, checkpoint: str) -> str:
 
 
 def main() -> int:
+    agent_entry = args_cli.agent or "rsl_rl_cfg_entry_point"
+
     # Let Hydra read the overrides through argv, matching the unified CLI behaviour.
     original_argv = sys.argv
     sys.argv = [sys.argv[0]] + hydra_overrides
     try:
-        env_cfg, agent_cfg = resolve_task_config(args_cli.task, args_cli.agent or "rsl_rl_cfg_entry_point")
+        env_cfg, agent_cfg = resolve_task_config(args_cli.task, agent_entry)
     finally:
         sys.argv = original_argv
 
@@ -109,7 +121,7 @@ def main() -> int:
     # legacy ``stochastic``/``init_noise_std`` keys, which the current ``MLPModel`` no longer accepts.
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, check_rsl_rl_version())
 
-    checkpoint_path = _resolve_checkpoint(args_cli.task, agent_cfg, env_cfg, args_cli.checkpoint)
+    checkpoint_path = _resolve_checkpoint(args_cli.task, agent_cfg, env_cfg, args_cli.checkpoint, agent_entry)
     print(f"[INFO] Loading checkpoint: {checkpoint_path}")
     log_dir = os.path.dirname(checkpoint_path)
 

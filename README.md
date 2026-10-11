@@ -35,7 +35,7 @@ Everything below was executed on Windows 11 / NVIDIA T1200 (4 GB VRAM) / Isaac S
 | Motion ONNX export | ✅ `ALL CHECKS PASSED` |
 | W&B upload | ✅ verified offline (including external-weight fix) |
 | W&B upload to cloud | ❌ needs credentials |
-| `--checkpoint latest` | ❌ broken, use an explicit path |
+| `--checkpoint latest` / `best` | ✅ verified (a wrapper bug was found and fixed) |
 | Real LAFAN1 training data | ❌ absent — only a synthetic stand-still clip |
 
 ---

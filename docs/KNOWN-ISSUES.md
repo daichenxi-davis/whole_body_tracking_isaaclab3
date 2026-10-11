@@ -4,7 +4,11 @@ Honest status of what is verified, what is broken, and what was never exercised.
 
 ---
 
-## 1. `--checkpoint latest` fails its manifest check
+## 1. `--checkpoint latest` — resolved (was a bug in this repo's tooling, not in Isaac Lab)
+
+**Status: fixed. Isaac Lab's own `isaaclab play --checkpoint latest` was never broken.**
+
+An earlier version of `scripts/export_policy.py` raised:
 
 ```
 ValueError: No compatible manifested run with a checkpoint was found in
@@ -12,16 +16,23 @@ ValueError: No compatible manifested run with a checkpoint was found in
 before using '--checkpoint latest'.
 ```
 
-Raised from `isaaclab_rl/entrypoints/common.py` `resolve_checkpoint_selector`. The run directory does
-contain a `run.json` manifest, so the compatibility predicate is rejecting on some other field —
-**root cause not investigated**. It may be task-name normalization or the recorded agent field.
+Two mistakes in this repo's wrapper, both invisible because the resolver *silently* finds zero
+compatible runs instead of reporting a mismatch:
 
-**Workaround:** pass an explicit checkpoint path. Verified working.
+1. **Task name not normalized.** Run manifests store `normalize_task_name(task)`, and
+   `play_rsl_rl.py:88` correctly passes `task=normalize_task_name(args_cli.task)`. The wrapper passed
+   the raw CLI task.
+2. **`agent=None`.** `_compatible_runs` compares `manifest["metadata"]["agent"]` against the requested
+   metadata. Manifests record `"agent": "rsl_rl_cfg_entry_point"`, so `agent=None` rejects every run.
+   Measured: `metadata={"agent": None}` → **0 compatible runs**;
+   `metadata={"agent": "rsl_rl_cfg_entry_point"}` → **11**.
 
-```powershell
-$ckpt = (Get-ChildItem "$IL\logs\rsl_rl\g1_flat" -Recurse -Filter "model_*.pt" |
-         Sort-Object LastWriteTime | Select-Object -Last 1).FullName
-```
+The framework path was verified correct by source inspection (`play_rsl_rl.py:88-89`: the task is
+normalized and `args_cli.agent` holds the entry point). Only `export_policy.py` needed fixing; it now
+mirrors those two details and resolves `latest` to the newest checkpoint.
+
+If you write your own resolver wrapper, note that a metadata mismatch produces an empty result rather
+than an error — check `_compatible_runs` directly when debugging.
 
 ---
 

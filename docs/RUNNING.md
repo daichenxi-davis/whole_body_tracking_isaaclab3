@@ -94,18 +94,25 @@ $env:WBT_G1_URDF="cylinder"   # pristine upstream geometry
 
 ## 2. Playback
 
-`--checkpoint latest` currently fails a manifest compatibility check. **Pass an explicit path.**
+```powershell
+& $PY -m isaaclab play --rl_library rsl_rl `
+  --task Tracking-Flat-G1-v0 --num_envs 2 `
+  --checkpoint latest `
+  --external_callback whole_body_tracking.tasks.register.register `
+  --visualizer newton_gl physics=isaacsim_physx `
+  "env.commands.motion.motion_file=$WBT\motions\g1_stand_synthetic.npz"
+```
+
+`--checkpoint` also accepts `best`, an explicit `.pt` path, or
+`wandb:<entity>/<project>/<run_id>`. The `latest`/`best` selectors read the `run.json` manifest that
+training writes, so they only see runs produced by the unified entrypoint — a `logs/` directory made
+by the old per-library scripts will not resolve.
+
+To find a checkpoint path manually:
 
 ```powershell
 $ckpt = (Get-ChildItem "$IL\logs\rsl_rl\g1_flat" -Recurse -Filter "model_*.pt" |
          Sort-Object LastWriteTime | Select-Object -Last 1).FullName
-
-& $PY -m isaaclab play --rl_library rsl_rl `
-  --task Tracking-Flat-G1-v0 --num_envs 2 `
-  --checkpoint "$ckpt" `
-  --external_callback whole_body_tracking.tasks.register.register `
-  --visualizer newton_gl physics=isaacsim_physx `
-  "env.commands.motion.motion_file=$WBT\motions\g1_stand_synthetic.npz"
 ```
 
 `isaaclab play` also writes a plain policy export to `<log_dir>/exported/`:
@@ -253,7 +260,7 @@ conversion — `MotionLoader` detects the quaternion order.
 | `unrecognized arguments: --headless` | Removed in 3.0. Use `--visualizer none`. |
 | `No module named pip` | The venv is uv-managed. Use `uv pip install`, not `python -m pip`. |
 | Task not found / `gym.error.NameNotFound` | Missing `--external_callback`. |
-| `No compatible manifested run with a checkpoint` | `--checkpoint latest` is broken here. Pass an explicit `.pt` path. |
+| `No compatible manifested run with a checkpoint` | `latest`/`best` see no compatible run. The run must have a `run.json` written by the unified entrypoint, and a custom resolver must pass `normalize_task_name(task)` and the agent entry point as metadata. |
 | `AttributeError: 'SimulationCfg' object has no attribute 'physx'` | Patch not applied, or you re-added `self.sim.physx`. Use `self.sim.physics`. |
 | `TypeError: MLPModel.__init__() got an unexpected keyword argument 'stochastic'` | Exporting a checkpoint trained with the deprecated `policy=` config. `export_policy.py` normalizes this; a custom script must call `handle_deprecated_rsl_rl_cfg`. |
 | `FileNotFoundError: Required asset is missing` | Assets not extracted. The error prints the exact `curl` command. |
