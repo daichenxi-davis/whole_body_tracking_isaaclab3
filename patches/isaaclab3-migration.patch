@@ -1,0 +1,1053 @@
+diff --git a/scripts/csv_to_npz.py b/scripts/csv_to_npz.py
+index 7c6b938..eadae02 100644
+--- a/scripts/csv_to_npz.py
++++ b/scripts/csv_to_npz.py
+@@ -115,7 +115,10 @@ class MotionLoader:
+         motion = motion.to(torch.float32).to(self.device)
+         self.motion_base_poss_input = motion[:, :3]
+         self.motion_base_rots_input = motion[:, 3:7]
+-        self.motion_base_rots_input = self.motion_base_rots_input[:, [3, 0, 1, 2]]  # convert to wxyz
++        # Isaac Lab 3.0 uses XYZW quaternions natively, and every isaaclab.utils.math quaternion
++        # helper below (quat_mul / quat_slerp / axis_angle_from_quat) now expects XYZW. Keep the input
++        # order as-is; the old `[:, [3, 0, 1, 2]]  # convert to wxyz` reorder is what would desync the
++        # generated file from the 3.0 math.
+         self.motion_dof_poss_input = motion[:, 7:]
+ 
+         self.input_frames = motion.shape[0]
+@@ -233,6 +236,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, joi
+     # ------- data logger -------------------------------------------------------
+     log = {
+         "fps": [args_cli.output_fps],
++        # Explicit marker so MotionLoader can tell a 3.0-native XYZW file from a legacy WXYZ one.
++        "quat_order": np.array("xyzw"),
+         "joint_pos": [],
+         "joint_vel": [],
+         "body_pos_w": [],
+diff --git a/source/whole_body_tracking/whole_body_tracking/assets/__init__.py b/source/whole_body_tracking/whole_body_tracking/assets/__init__.py
+index 31e09f0..0be36b6 100644
+--- a/source/whole_body_tracking/whole_body_tracking/assets/__init__.py
++++ b/source/whole_body_tracking/whole_body_tracking/assets/__init__.py
+@@ -1,4 +1,57 @@
++"""Asset location helpers for the whole_body_tracking extension.
++
++Robot description files are not checked into this repository. They are pulled from the Unitree
++description tarball documented in the repository README:
++
++.. code-block:: bash
++
++    curl -L -o unitree_description.tar.gz \\
++      https://storage.googleapis.com/qiayuanl_robot_descriptions/unitree_description.tar.gz && \\
++    tar -xzf unitree_description.tar.gz -C source/whole_body_tracking/whole_body_tracking/assets/
++
++A missing asset used to fail late and quietly: Isaac Sim reports the unresolved geometry with only
++``Failed to find rigid body at ...`` warnings and continues, so the fault surfaces as a policy that
++trains against a robot with no visual/collision meshes. :func:`require_asset` turns that into an
++immediate, actionable error instead.
++"""
++
+ import os
+ 
+ # Conveniences to other module directories via relative paths
+ ASSET_DIR = os.path.abspath(os.path.dirname(__file__))
++
++
++def asset_path(*parts: str) -> str:
++    """Return an absolute path inside the extension's asset directory."""
++    return os.path.join(ASSET_DIR, *parts)
++
++
++def require_asset(*parts: str, hint: str | None = None) -> str:
++    """Return the absolute path of an asset, raising a clear error when it is absent.
++
++    Args:
++        *parts: Path components relative to :data:`ASSET_DIR`.
++        hint: Optional extra guidance appended to the error message.
++
++    Returns:
++        The absolute path of the asset.
++
++    Raises:
++        FileNotFoundError: If the asset does not exist on disk.
++    """
++    path = asset_path(*parts)
++    if not os.path.exists(path):
++        rel = os.path.join(*parts)
++        message = (
++            f"Required asset is missing: {path}\n"
++            f"Expected '{rel}' under the extension asset directory:\n  {ASSET_DIR}\n"
++            "Fetch the robot description files with (from the repository root):\n"
++            "  curl -L -o unitree_description.tar.gz "
++            "https://storage.googleapis.com/qiayuanl_robot_descriptions/unitree_description.tar.gz\n"
++            "  tar -xzf unitree_description.tar.gz -C "
++            "source/whole_body_tracking/whole_body_tracking/assets/"
++        )
++        if hint:
++            message += f"\n{hint}"
++        raise FileNotFoundError(message)
++    return path
+diff --git a/source/whole_body_tracking/whole_body_tracking/robots/g1.py b/source/whole_body_tracking/whole_body_tracking/robots/g1.py
+index 9b69ceb..1e21410 100644
+--- a/source/whole_body_tracking/whole_body_tracking/robots/g1.py
++++ b/source/whole_body_tracking/whole_body_tracking/robots/g1.py
+@@ -1,8 +1,10 @@
++import os
++
+ import isaaclab.sim as sim_utils
+ from isaaclab.actuators import ImplicitActuatorCfg
+ from isaaclab.assets.articulation import ArticulationCfg
+ 
+-from whole_body_tracking.assets import ASSET_DIR
++from whole_body_tracking.assets import require_asset
+ 
+ ARMATURE_5020 = 0.003609725
+ ARMATURE_7520_14 = 0.010177520
+@@ -22,11 +24,38 @@ DAMPING_7520_14 = 2.0 * DAMPING_RATIO * ARMATURE_7520_14 * NATURAL_FREQ
+ DAMPING_7520_22 = 2.0 * DAMPING_RATIO * ARMATURE_7520_22 * NATURAL_FREQ
+ DAMPING_4010 = 2.0 * DAMPING_RATIO * ARMATURE_4010 * NATURAL_FREQ
+ 
++# Collision-shape variant selection.
++#
++# Upstream Isaac Lab 2.x converted the G1's 28 cylinder collision geoms into capsules inside the URDF
++# importer (``replace_cylinders_with_capsules=True``). URDF importer 3.0 removed that option
++# (migration guide, deprecated-settings table), and PhysX cylinders generate spurious rim/edge
++# contacts, so the conversion now has to happen in the URDF itself. ``scripts/make_capsule_urdf.py``
++# produces that variant.
++#
++# Default: use the capsule variant when it exists, else fall back to the pristine URDF.
++# Override explicitly with ``WBT_G1_URDF=capsule`` or ``WBT_G1_URDF=cylinder``.
++_URDF_CYLINDER = "main.urdf"
++_URDF_CAPSULE = "main_capsule.urdf"
++_override = os.environ.get("WBT_G1_URDF", "").strip().lower()
++if _override == "cylinder":
++    _urdf_file = _URDF_CYLINDER
++elif _override == "capsule":
++    _urdf_file = _URDF_CAPSULE
++else:
++    # auto: prefer the capsule variant when it has been generated
++    try:
++        require_asset("unitree_description", "urdf", "g1", _URDF_CAPSULE)
++        _urdf_file = _URDF_CAPSULE
++    except FileNotFoundError:
++        _urdf_file = _URDF_CYLINDER
++
++G1_URDF_PATH = require_asset("unitree_description", "urdf", "g1", _urdf_file)
++
++
+ G1_CYLINDER_CFG = ArticulationCfg(
+     spawn=sim_utils.UrdfFileCfg(
+         fix_base=False,
+-        replace_cylinders_with_capsules=True,
+-        asset_path=f"{ASSET_DIR}/unitree_description/urdf/g1/main.urdf",
++        asset_path=G1_URDF_PATH,
+         activate_contact_sensors=True,
+         rigid_props=sim_utils.RigidBodyPropertiesCfg(
+             disable_gravity=False,
+@@ -67,13 +96,13 @@ G1_CYLINDER_CFG = ArticulationCfg(
+                 ".*_hip_pitch_joint",
+                 ".*_knee_joint",
+             ],
+-            effort_limit_sim={
++            joint_effort_limit={
+                 ".*_hip_yaw_joint": 88.0,
+                 ".*_hip_roll_joint": 139.0,
+                 ".*_hip_pitch_joint": 88.0,
+                 ".*_knee_joint": 139.0,
+             },
+-            velocity_limit_sim={
++            joint_velocity_limit={
+                 ".*_hip_yaw_joint": 32.0,
+                 ".*_hip_roll_joint": 20.0,
+                 ".*_hip_pitch_joint": 32.0,
+@@ -99,24 +128,24 @@ G1_CYLINDER_CFG = ArticulationCfg(
+             },
+         ),
+         "feet": ImplicitActuatorCfg(
+-            effort_limit_sim=50.0,
+-            velocity_limit_sim=37.0,
++            joint_effort_limit=50.0,
++            joint_velocity_limit=37.0,
+             joint_names_expr=[".*_ankle_pitch_joint", ".*_ankle_roll_joint"],
+             stiffness=2.0 * STIFFNESS_5020,
+             damping=2.0 * DAMPING_5020,
+             armature=2.0 * ARMATURE_5020,
+         ),
+         "waist": ImplicitActuatorCfg(
+-            effort_limit_sim=50,
+-            velocity_limit_sim=37.0,
++            joint_effort_limit=50,
++            joint_velocity_limit=37.0,
+             joint_names_expr=["waist_roll_joint", "waist_pitch_joint"],
+             stiffness=2.0 * STIFFNESS_5020,
+             damping=2.0 * DAMPING_5020,
+             armature=2.0 * ARMATURE_5020,
+         ),
+         "waist_yaw": ImplicitActuatorCfg(
+-            effort_limit_sim=88,
+-            velocity_limit_sim=32.0,
++            joint_effort_limit=88,
++            joint_velocity_limit=32.0,
+             joint_names_expr=["waist_yaw_joint"],
+             stiffness=STIFFNESS_7520_14,
+             damping=DAMPING_7520_14,
+@@ -132,7 +161,7 @@ G1_CYLINDER_CFG = ArticulationCfg(
+                 ".*_wrist_pitch_joint",
+                 ".*_wrist_yaw_joint",
+             ],
+-            effort_limit_sim={
++            joint_effort_limit={
+                 ".*_shoulder_pitch_joint": 25.0,
+                 ".*_shoulder_roll_joint": 25.0,
+                 ".*_shoulder_yaw_joint": 25.0,
+@@ -141,7 +170,7 @@ G1_CYLINDER_CFG = ArticulationCfg(
+                 ".*_wrist_pitch_joint": 5.0,
+                 ".*_wrist_yaw_joint": 5.0,
+             },
+-            velocity_limit_sim={
++            joint_velocity_limit={
+                 ".*_shoulder_pitch_joint": 37.0,
+                 ".*_shoulder_roll_joint": 37.0,
+                 ".*_shoulder_yaw_joint": 37.0,
+@@ -183,7 +212,9 @@ G1_CYLINDER_CFG = ArticulationCfg(
+ 
+ G1_ACTION_SCALE = {}
+ for a in G1_CYLINDER_CFG.actuators.values():
+-    e = a.effort_limit_sim
++    # Isaac Lab 3.0: the solver joint limit is ``joint_effort_limit``; ``effort_limit_sim`` is a
++    # deprecated alias that is removed in 3.1.
++    e = a.joint_effort_limit
+     s = a.stiffness
+     names = a.joint_names_expr
+     if not isinstance(e, dict):
+diff --git a/source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/agents/rsl_rl_ppo_cfg.py b/source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/agents/rsl_rl_ppo_cfg.py
+index ab1c18d..34bf32a 100644
+--- a/source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/agents/rsl_rl_ppo_cfg.py
++++ b/source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/agents/rsl_rl_ppo_cfg.py
+@@ -1,5 +1,9 @@
+ from isaaclab.utils import configclass
+-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg
++from isaaclab_rl.rsl_rl import (
++    RslRlMLPModelCfg,
++    RslRlOnPolicyRunnerCfg,
++    RslRlPpoAlgorithmCfg,
++)
+ 
+ 
+ @configclass
+@@ -8,12 +12,22 @@ class G1FlatPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+     max_iterations = 30000
+     save_interval = 500
+     experiment_name = "g1_flat"
+-    empirical_normalization = True
+-    policy = RslRlPpoActorCriticCfg(
+-        init_noise_std=1.0,
+-        actor_hidden_dims=[512, 256, 128],
+-        critic_hidden_dims=[512, 256, 128],
++    # Isaac Lab 3.0 requires the observation-group routing explicitly; the base field defaults to
++    # MISSING, which ``to_dict()`` turns into ``{}`` and rsl_rl then has to auto-fill with a warning.
++    obs_groups = {"actor": ["policy"], "critic": ["critic"]}
++    # Modern rsl-rl >= 4.0 model configuration. The former ``policy=RslRlPpoActorCriticCfg(...)`` plus
++    # ``empirical_normalization=True`` pair is deprecated and unsupported from Isaac Lab 3.1 on; the
++    # equivalent is one model cfg per network with ``obs_normalization`` set on it.
++    actor = RslRlMLPModelCfg(
++        hidden_dims=[512, 256, 128],
+         activation="elu",
++        obs_normalization=True,
++        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=1.0, std_type="scalar"),
++    )
++    critic = RslRlMLPModelCfg(
++        hidden_dims=[512, 256, 128],
++        activation="elu",
++        obs_normalization=True,
+     )
+     algorithm = RslRlPpoAlgorithmCfg(
+         value_loss_coef=1.0,
+diff --git a/source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/humanoid/agents/rsl_rl_ppo_cfg.py b/source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/humanoid/agents/rsl_rl_ppo_cfg.py
+index 3dbcdcf..b9c6e38 100644
+--- a/source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/humanoid/agents/rsl_rl_ppo_cfg.py
++++ b/source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/humanoid/agents/rsl_rl_ppo_cfg.py
+@@ -1,5 +1,9 @@
+ from isaaclab.utils import configclass
+-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg
++from isaaclab_rl.rsl_rl import (
++    RslRlMLPModelCfg,
++    RslRlOnPolicyRunnerCfg,
++    RslRlPpoAlgorithmCfg,
++)
+ 
+ 
+ @configclass
+@@ -8,12 +12,19 @@ class HumanoidFlatPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+     max_iterations = 5000
+     save_interval = 50
+     experiment_name = "humanoid_flat"
+-    empirical_normalization = False
+-    policy = RslRlPpoActorCriticCfg(
+-        init_noise_std=1.0,
+-        actor_hidden_dims=[512, 256, 128],
+-        critic_hidden_dims=[512, 256, 128],
++    # Isaac Lab 3.0 requires the observation-group routing explicitly (see the G1 config).
++    obs_groups = {"actor": ["policy"], "critic": ["critic"]}
++    # Modern rsl-rl >= 4.0 model configuration; ``actor``/``critic`` replace the deprecated ``policy``.
++    actor = RslRlMLPModelCfg(
++        hidden_dims=[512, 256, 128],
+         activation="elu",
++        obs_normalization=False,
++        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=1.0, std_type="scalar"),
++    )
++    critic = RslRlMLPModelCfg(
++        hidden_dims=[512, 256, 128],
++        activation="elu",
++        obs_normalization=False,
+     )
+     algorithm = RslRlPpoAlgorithmCfg(
+         value_loss_coef=1.0,
+diff --git a/source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/humanoid/flat_env_cfg.py b/source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/humanoid/flat_env_cfg.py
+index f01dc43..00b2baa 100644
+--- a/source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/humanoid/flat_env_cfg.py
++++ b/source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/humanoid/flat_env_cfg.py
+@@ -15,7 +15,9 @@ class HumanoidFlatEnvCfg(TrackingEnvCfg):
+             actuators={
+                 "body": ImplicitActuatorCfg(
+                     joint_names_expr=[".*"],
+-                    velocity_limit=100.0,
++                    # Isaac Lab 3.0 renamed actuator limit fields; ``velocity_limit`` is a deprecated
++                    # alias removed in 3.1.
++                    joint_velocity_limit=100.0,
+                     stiffness=None,
+                     damping=None,
+                 ),
+diff --git a/source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/commands.py b/source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/commands.py
+index 5325068..b915af5 100644
+--- a/source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/commands.py
++++ b/source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/commands.py
+@@ -36,6 +36,20 @@ class MotionLoader:
+         self.joint_vel = torch.tensor(data["joint_vel"], dtype=torch.float32, device=device)
+         self._body_pos_w = torch.tensor(data["body_pos_w"], dtype=torch.float32, device=device)
+         self._body_quat_w = torch.tensor(data["body_quat_w"], dtype=torch.float32, device=device)
++
++        # Isaac Lab 3.0 switched its quaternion convention from WXYZ to XYZW, and every
++        # ``isaaclab.utils.math`` quaternion helper now expects XYZW. Reference motions produced by
++        # the upstream Isaac Sim 4.5 pipeline are WXYZ, so they must be converted exactly once.
++        #
++        # Modern motion files carry an explicit ``quat_order`` marker. Older files are assumed to be
++        # WXYZ (the upstream default) and converted, which keeps previously generated datasets usable.
++        quat_order = str(data["quat_order"]) if "quat_order" in data.files else "wxyz"
++        if quat_order == "wxyz":
++            # (w, x, y, z) -> (x, y, z, w); same operation as isaaclab.utils.math.convert_quat(q, "xyzw").
++            self._body_quat_w = torch.roll(self._body_quat_w, shifts=-1, dims=-1)
++        elif quat_order != "xyzw":
++            raise ValueError(f"Unsupported quat_order '{quat_order}' in {motion_file}; expected 'wxyz' or 'xyzw'.")
++
+         self._body_lin_vel_w = torch.tensor(data["body_lin_vel_w"], dtype=torch.float32, device=device)
+         self._body_ang_vel_w = torch.tensor(data["body_ang_vel_w"], dtype=torch.float32, device=device)
+         self._body_indexes = body_indexes
+@@ -75,7 +89,8 @@ class MotionCommand(CommandTerm):
+         self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+         self.body_pos_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 3, device=self.device)
+         self.body_quat_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 4, device=self.device)
+-        self.body_quat_relative_w[:, :, 0] = 1.0
++        # Isaac Lab 3.0 uses XYZW quaternion order (identity = (0, 0, 0, 1)); the scalar part is last.
++        self.body_quat_relative_w[:, :, 3] = 1.0
+ 
+         self.bin_count = int(self.motion.time_step_total // (1 / (env.cfg.decimation * env.cfg.sim.dt))) + 1
+         self.bin_failed_count = torch.zeros(self.bin_count, dtype=torch.float, device=self.device)
+@@ -143,43 +158,43 @@ class MotionCommand(CommandTerm):
+ 
+     @property
+     def robot_joint_pos(self) -> torch.Tensor:
+-        return self.robot.data.joint_pos
++        return self.robot.data.joint_pos.torch
+ 
+     @property
+     def robot_joint_vel(self) -> torch.Tensor:
+-        return self.robot.data.joint_vel
++        return self.robot.data.joint_vel.torch
+ 
+     @property
+     def robot_body_pos_w(self) -> torch.Tensor:
+-        return self.robot.data.body_pos_w[:, self.body_indexes]
++        return self.robot.data.body_pos_w.torch[:, self.body_indexes]
+ 
+     @property
+     def robot_body_quat_w(self) -> torch.Tensor:
+-        return self.robot.data.body_quat_w[:, self.body_indexes]
++        return self.robot.data.body_quat_w.torch[:, self.body_indexes]
+ 
+     @property
+     def robot_body_lin_vel_w(self) -> torch.Tensor:
+-        return self.robot.data.body_lin_vel_w[:, self.body_indexes]
++        return self.robot.data.body_lin_vel_w.torch[:, self.body_indexes]
+ 
+     @property
+     def robot_body_ang_vel_w(self) -> torch.Tensor:
+-        return self.robot.data.body_ang_vel_w[:, self.body_indexes]
++        return self.robot.data.body_ang_vel_w.torch[:, self.body_indexes]
+ 
+     @property
+     def robot_anchor_pos_w(self) -> torch.Tensor:
+-        return self.robot.data.body_pos_w[:, self.robot_anchor_body_index]
++        return self.robot.data.body_pos_w.torch[:, self.robot_anchor_body_index]
+ 
+     @property
+     def robot_anchor_quat_w(self) -> torch.Tensor:
+-        return self.robot.data.body_quat_w[:, self.robot_anchor_body_index]
++        return self.robot.data.body_quat_w.torch[:, self.robot_anchor_body_index]
+ 
+     @property
+     def robot_anchor_lin_vel_w(self) -> torch.Tensor:
+-        return self.robot.data.body_lin_vel_w[:, self.robot_anchor_body_index]
++        return self.robot.data.body_lin_vel_w.torch[:, self.robot_anchor_body_index]
+ 
+     @property
+     def robot_anchor_ang_vel_w(self) -> torch.Tensor:
+-        return self.robot.data.body_ang_vel_w[:, self.robot_anchor_body_index]
++        return self.robot.data.body_ang_vel_w.torch[:, self.robot_anchor_body_index]
+ 
+     def _update_metrics(self):
+         self.metrics["error_anchor_pos"] = torch.norm(self.anchor_pos_w - self.robot_anchor_pos_w, dim=-1)
+@@ -241,6 +256,12 @@ class MotionCommand(CommandTerm):
+         self.metrics["sampling_top1_bin"][:] = imax.float() / self.bin_count
+ 
+     def _resample_command(self, env_ids: Sequence[int]):
++        # Isaac Lab 3.0's CommandManager passes ``slice(None)`` to mean "every environment", so
++        # normalize it to an explicit index tensor: the resampling code below needs ``len()``,
++        # boolean masking and scalar-tensor indexing, none of which a slice supports.
++        if isinstance(env_ids, slice):
++            assert env_ids == slice(None), f"Unsupported slice for env_ids: {env_ids}"
++            env_ids = torch.arange(self.num_envs, device=self.device)
+         if len(env_ids) == 0:
+             return
+         self._adaptive_sampling(env_ids)
+@@ -266,14 +287,18 @@ class MotionCommand(CommandTerm):
+         joint_vel = self.joint_vel.clone()
+ 
+         joint_pos += sample_uniform(*self.cfg.joint_position_range, joint_pos.shape, joint_pos.device)
+-        soft_joint_pos_limits = self.robot.data.soft_joint_pos_limits[env_ids]
++        soft_joint_pos_limits = self.robot.data.soft_joint_pos_limits.torch[env_ids]
+         joint_pos[env_ids] = torch.clip(
+             joint_pos[env_ids], soft_joint_pos_limits[:, :, 0], soft_joint_pos_limits[:, :, 1]
+         )
+-        self.robot.write_joint_state_to_sim(joint_pos[env_ids], joint_vel[env_ids], env_ids=env_ids)
+-        self.robot.write_root_state_to_sim(
+-            torch.cat([root_pos[env_ids], root_ori[env_ids], root_lin_vel[env_ids], root_ang_vel[env_ids]], dim=-1),
+-            env_ids=env_ids,
++        # Isaac Lab 3.0 split the legacy write_*_to_sim methods into explicit _index/_mask variants.
++        self.robot.write_joint_position_to_sim_index(position=joint_pos[env_ids], env_ids=env_ids)
++        self.robot.write_joint_velocity_to_sim_index(velocity=joint_vel[env_ids], env_ids=env_ids)
++        self.robot.write_root_link_pose_to_sim_index(
++            root_pose=torch.cat([root_pos[env_ids], root_ori[env_ids]], dim=-1), env_ids=env_ids
++        )
++        self.robot.write_root_com_velocity_to_sim_index(
++            root_velocity=torch.cat([root_lin_vel[env_ids], root_ang_vel[env_ids]], dim=-1), env_ids=env_ids
+         )
+ 
+     def _update_command(self):
+diff --git a/source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/events.py b/source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/events.py
+index f70e8a1..15bc930 100644
+--- a/source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/events.py
++++ b/source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/events.py
+@@ -3,91 +3,63 @@ from __future__ import annotations
+ import torch
+ from typing import TYPE_CHECKING, Literal
+ 
+-import isaaclab.utils.math as math_utils
+ from isaaclab.assets import Articulation
+ from isaaclab.envs.mdp.events import _randomize_prop_by_op
+-from isaaclab.managers import SceneEntityCfg
++from isaaclab.managers import EventTermCfg, ManagerTermBase, SceneEntityCfg
+ 
+ if TYPE_CHECKING:
+     from isaaclab.envs import ManagerBasedEnv
+ 
+ 
+-def randomize_joint_default_pos(
+-    env: ManagerBasedEnv,
+-    env_ids: torch.Tensor | None,
+-    asset_cfg: SceneEntityCfg,
+-    pos_distribution_params: tuple[float, float] | None = None,
+-    operation: Literal["add", "scale", "abs"] = "abs",
+-    distribution: Literal["uniform", "log_uniform", "gaussian"] = "uniform",
+-):
+-    """
+-    Randomize the joint default positions which may be different from URDF due to calibration errors.
+-    """
+-    # extract the used quantities (to enable type-hinting)
+-    asset: Articulation = env.scene[asset_cfg.name]
+-
+-    # save nominal value for export
+-    asset.data.default_joint_pos_nominal = torch.clone(asset.data.default_joint_pos[0])
+-
+-    # resolve environment ids
+-    if env_ids is None:
+-        env_ids = torch.arange(env.scene.num_envs, device=asset.device)
+-
+-    # resolve joint indices
+-    if asset_cfg.joint_ids == slice(None):
+-        joint_ids = slice(None)  # for optimization purposes
+-    else:
+-        joint_ids = torch.tensor(asset_cfg.joint_ids, dtype=torch.int, device=asset.device)
+-
+-    if pos_distribution_params is not None:
+-        pos = asset.data.default_joint_pos.to(asset.device).clone()
+-        pos = _randomize_prop_by_op(
+-            pos, pos_distribution_params, env_ids, joint_ids, operation=operation, distribution=distribution
+-        )[env_ids][:, joint_ids]
+-
+-        if env_ids != slice(None) and joint_ids != slice(None):
+-            env_ids = env_ids[:, None]
+-        asset.data.default_joint_pos[env_ids, joint_ids] = pos
+-        # update the offset in action since it is not updated automatically
+-        env.action_manager.get_term("joint_pos")._offset[env_ids, joint_ids] = pos
++class randomize_joint_default_pos(ManagerTermBase):
++    """Randomize the joint default positions, which may differ from the URDF due to calibration errors.
+ 
+-
+-def randomize_rigid_body_com(
+-    env: ManagerBasedEnv,
+-    env_ids: torch.Tensor | None,
+-    com_range: dict[str, tuple[float, float]],
+-    asset_cfg: SceneEntityCfg,
+-):
+-    """Randomize the center of mass (CoM) of rigid bodies by adding a random value sampled from the given ranges.
+-
+-    .. note::
+-        This function uses CPU tensors to assign the CoM. It is recommended to use this function
+-        only during the initialization of the environment.
++    Implemented as a :class:`~isaaclab.managers.ManagerTermBase` (rather than a plain function) so
++    that the pre-randomization nominal default joint positions can be cached for the policy
++    exporter. Isaac Lab 3.0 removed ``ArticulationData.default_joint_pos_nominal``, which the
++    upstream implementation used as that cache; the cached tensor now lives on this term instance
++    and is reached through
++    ``env.event_manager.get_term_cfg("add_joint_default_pos").func._default_joint_pos_nominal``.
+     """
+-    # extract the used quantities (to enable type-hinting)
+-    asset: Articulation = env.scene[asset_cfg.name]
+-    # resolve environment ids
+-    if env_ids is None:
+-        env_ids = torch.arange(env.scene.num_envs, device="cpu")
+-    else:
+-        env_ids = env_ids.cpu()
+-
+-    # resolve body indices
+-    if asset_cfg.body_ids == slice(None):
+-        body_ids = torch.arange(asset.num_bodies, dtype=torch.int, device="cpu")
+-    else:
+-        body_ids = torch.tensor(asset_cfg.body_ids, dtype=torch.int, device="cpu")
+-
+-    # sample random CoM values
+-    range_list = [com_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z"]]
+-    ranges = torch.tensor(range_list, device="cpu")
+-    rand_samples = math_utils.sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 3), device="cpu").unsqueeze(1)
+-
+-    # get the current com of the bodies (num_assets, num_bodies)
+-    coms = asset.root_physx_view.get_coms().clone()
+-
+-    # Randomize the com in range
+-    coms[:, body_ids, :3] += rand_samples
+ 
+-    # Set the new coms
+-    asset.root_physx_view.set_coms(coms, env_ids)
++    def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
++        super().__init__(cfg, env)
++        self.asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
++        asset: Articulation = env.scene[self.asset_cfg.name]
++        # Cache the nominal default joint positions before any randomization is applied.
++        self._default_joint_pos_nominal = asset.data.default_joint_pos.torch[0].clone()
++
++    def __call__(
++        self,
++        env: ManagerBasedEnv,
++        env_ids: torch.Tensor | None,
++        asset_cfg: SceneEntityCfg,
++        pos_distribution_params: tuple[float, float] | None = None,
++        operation: Literal["add", "scale", "abs"] = "abs",
++        distribution: Literal["uniform", "log_uniform", "gaussian"] = "uniform",
++    ):
++        """Randomize the joint default positions for the given asset."""
++        # extract the used quantities (to enable type-hinting)
++        asset: Articulation = env.scene[asset_cfg.name]
++
++        # resolve environment ids
++        if env_ids is None:
++            env_ids = torch.arange(env.scene.num_envs, device=asset.device)
++
++        # resolve joint indices
++        if asset_cfg.joint_ids == slice(None):
++            joint_ids = slice(None)  # for optimization purposes
++        else:
++            joint_ids = torch.tensor(asset_cfg.joint_ids, dtype=torch.int, device=asset.device)
++
++        if pos_distribution_params is not None:
++            pos = asset.data.default_joint_pos.torch.to(asset.device).clone()
++            pos = _randomize_prop_by_op(
++                pos, pos_distribution_params, env_ids, joint_ids, operation=operation, distribution=distribution
++            )[env_ids][:, joint_ids]
++
++            if env_ids != slice(None) and joint_ids != slice(None):
++                env_ids = env_ids[:, None]
++            asset.data.default_joint_pos.torch[env_ids, joint_ids] = pos
++            # update the offset in action since it is not updated automatically
++            env.action_manager.get_term("joint_pos")._offset[env_ids, joint_ids] = pos
+diff --git a/source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/observations.py b/source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/observations.py
+index 5ce8c2d..fbb21dc 100644
+--- a/source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/observations.py
++++ b/source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/observations.py
+@@ -20,13 +20,13 @@ def robot_anchor_ori_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+ def robot_anchor_lin_vel_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+     command: MotionCommand = env.command_manager.get_term(command_name)
+ 
+-    return command.robot_anchor_vel_w[:, :3].view(env.num_envs, -1)
++    return command.robot_anchor_lin_vel_w.view(env.num_envs, -1)
+ 
+ 
+ def robot_anchor_ang_vel_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+     command: MotionCommand = env.command_manager.get_term(command_name)
+ 
+-    return command.robot_anchor_vel_w[:, 3:6].view(env.num_envs, -1)
++    return command.robot_anchor_ang_vel_w.view(env.num_envs, -1)
+ 
+ 
+ def robot_body_pos_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+diff --git a/source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/rewards.py b/source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/rewards.py
+index 6e07c18..a8d0330 100644
+--- a/source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/rewards.py
++++ b/source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/rewards.py
+@@ -76,7 +76,8 @@ def motion_global_body_angular_velocity_error_exp(
+ 
+ def feet_contact_time(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, threshold: float) -> torch.Tensor:
+     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+-    first_air = contact_sensor.compute_first_air(env.step_dt, env.physics_dt)[:, sensor_cfg.body_ids]
+-    last_contact_time = contact_sensor.data.last_contact_time[:, sensor_cfg.body_ids]
++    # Isaac Lab 3.0 returns ProxyArray from sensor data; take the torch view for indexing.
++    first_air = contact_sensor.compute_first_air(env.step_dt, env.physics_dt).torch[:, sensor_cfg.body_ids]
++    last_contact_time = contact_sensor.data.last_contact_time.torch[:, sensor_cfg.body_ids]
+     reward = torch.sum((last_contact_time < threshold) * first_air, dim=-1)
+     return reward
+diff --git a/source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/terminations.py b/source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/terminations.py
+index 6b7b762..b42c24c 100644
+--- a/source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/terminations.py
++++ b/source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/terminations.py
+@@ -31,9 +31,15 @@ def bad_anchor_ori(
+     asset: RigidObject | Articulation = env.scene[asset_cfg.name]
+ 
+     command: MotionCommand = env.command_manager.get_term(command_name)
+-    motion_projected_gravity_b = math_utils.quat_rotate_inverse(command.anchor_quat_w, asset.data.GRAVITY_VEC_W)
+-
+-    robot_projected_gravity_b = math_utils.quat_rotate_inverse(command.robot_anchor_quat_w, asset.data.GRAVITY_VEC_W)
++    # ``math_utils.quat_*`` helpers are @torch.jit.script-decorated, and the TorchScript dispatcher
++    # does not honour ProxyArray's ``__torch_function__`` bridge, so the gravity vector must be an
++    # explicit torch.Tensor here.
++    gravity_vec_w = asset.data.GRAVITY_VEC_W.torch
++    # ``quat_rotate_inverse`` is deprecated in 3.0 in favour of ``quat_apply_inverse``; the old name
++    # warns on every call, which floods the console at one warning per environment per step.
++    motion_projected_gravity_b = math_utils.quat_apply_inverse(command.anchor_quat_w, gravity_vec_w)
++
++    robot_projected_gravity_b = math_utils.quat_apply_inverse(command.robot_anchor_quat_w, gravity_vec_w)
+ 
+     return (motion_projected_gravity_b[:, 2] - robot_projected_gravity_b[:, 2]).abs() > threshold
+ 
+diff --git a/source/whole_body_tracking/whole_body_tracking/tasks/tracking/tracking_env_cfg.py b/source/whole_body_tracking/whole_body_tracking/tasks/tracking/tracking_env_cfg.py
+index b050402..b8ca1fc 100644
+--- a/source/whole_body_tracking/whole_body_tracking/tasks/tracking/tracking_env_cfg.py
++++ b/source/whole_body_tracking/whole_body_tracking/tasks/tracking/tracking_env_cfg.py
+@@ -19,7 +19,10 @@ from isaaclab.terrains import TerrainImporterCfg
+ # Pre-defined configs
+ ##
+ from isaaclab.utils import configclass
+-from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
++from isaaclab.utils.noise import UniformNoiseCfg as Unoise
++from isaaclab_physx.physics import PhysxCfg
++from isaaclab_tasks.utils import PresetCfg
++from isaaclab_visualizers.kit import KitVisualizerCfg
+ 
+ import whole_body_tracking.tasks.tracking.mdp as mdp
+ 
+@@ -37,6 +40,20 @@ VELOCITY_RANGE = {
+ }
+ 
+ 
++@configclass
++class TrackingPhysicsCfg(PresetCfg):
++    """Physics backend presets for the tracking environment.
++
++    Isaac Lab 3.0 requires ``SimulationCfg.physics`` to be set explicitly. If it is left at its
++    default (``None``) the simulation falls back to ``PhysxCfg()``, which then needs the Isaac Sim
++    PhysX runtime; and the ``physics=`` CLI selector only works when a :class:`PresetCfg` with a
++    matching field name is attached to ``sim.physics``.
++    """
++
++    isaacsim_physx: PhysxCfg = PhysxCfg(gpu_max_rigid_patch_count=10 * 2**15)
++    default: PhysxCfg = isaacsim_physx
++
++
+ @configclass
+ class MySceneCfg(InteractiveSceneCfg):
+     """Configuration for the terrain scene with a legged robot."""
+@@ -69,7 +86,7 @@ class MySceneCfg(InteractiveSceneCfg):
+         spawn=sim_utils.DomeLightCfg(color=(0.13, 0.13, 0.13), intensity=1000.0),
+     )
+     contact_forces = ContactSensorCfg(
+-        prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True, force_threshold=10.0, debug_vis=True
++        prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=2, track_air_time=True, force_threshold=10.0, debug_vis=False
+     )
+ 
+ 
+@@ -85,7 +102,7 @@ class CommandsCfg:
+     motion = mdp.MotionCommandCfg(
+         asset_name="robot",
+         resampling_time_range=(1.0e9, 1.0e9),
+-        debug_vis=True,
++        debug_vis=False,
+         pose_range={
+             "x": (-0.05, 0.05),
+             "y": (-0.05, 0.05),
+@@ -295,7 +312,8 @@ class TrackingEnvCfg(ManagerBasedRLEnvCfg):
+     """Configuration for the locomotion velocity-tracking environment."""
+ 
+     # Scene settings
+-    scene: MySceneCfg = MySceneCfg(num_envs=4096, env_spacing=2.5)
++    # NOTE: num_envs is reduced from the upstream 4096 because the local GPU has 4 GB VRAM.
++    scene: MySceneCfg = MySceneCfg(num_envs=64, env_spacing=2.5)
+     # Basic settings
+     observations: ObservationsCfg = ObservationsCfg()
+     actions: ActionsCfg = ActionsCfg()
+@@ -315,8 +333,17 @@ class TrackingEnvCfg(ManagerBasedRLEnvCfg):
+         self.sim.dt = 0.005
+         self.sim.render_interval = self.decimation
+         self.sim.physics_material = self.scene.terrain.physics_material
+-        self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**15
++        # Physics backend. In Isaac Lab 3.0 this is an explicit config; the old
++        # ``self.sim.physx.*`` field no longer exists. Keeping it a PresetCfg lets the
++        # unified CLI select a backend with ``physics=isaacsim_physx``.
++        self.sim.physics = TrackingPhysicsCfg()
+         # viewer settings
+-        self.viewer.eye = (1.5, 1.5, 1.5)
+-        self.viewer.origin_type = "asset_root"
+-        self.viewer.asset_name = "robot"
++        # ``env_cfg.viewer`` is deprecated in Isaac Lab 3.0 (removed in a future release); the
++        # equivalent modern form is ``sim.default_visualizer_cfg``. The old
++        # ``origin_type="asset_root"`` / ``asset_name="robot"`` pair maps to
++        # ``origin_type="asset"`` / ``origin_track_path="robot"``.
++        self.sim.default_visualizer_cfg = KitVisualizerCfg(
++            eye=(1.5, 1.5, 1.5),
++            origin_type="asset",
++            origin_track_path="robot",
++        )
+diff --git a/source/whole_body_tracking/whole_body_tracking/utils/exporter.py b/source/whole_body_tracking/whole_body_tracking/utils/exporter.py
+index e096f90..478df06 100644
+--- a/source/whole_body_tracking/whole_body_tracking/utils/exporter.py
++++ b/source/whole_body_tracking/whole_body_tracking/utils/exporter.py
+@@ -3,66 +3,143 @@
+ #
+ # SPDX-License-Identifier: BSD-3-Clause
+ 
++"""ONNX export for whole-body tracking motion policies.
++
++The upstream BeyondMimic exporter subclassed ``isaaclab_rl.rsl_rl.exporter._OnnxPolicyExporter``,
++which copies ``policy.actor`` (or ``policy.student``) and raises
++``ValueError("Policy does not have an actor/student module.")`` when handed anything else.
++
++With rsl-rl >= 4.0 the policy is an :class:`rsl_rl.models.MLPModel`, which exposes ``mlp`` and
++``obs_normalizer`` instead, so that base class no longer applies. This module builds the ONNX graph
++directly on top of the model's public pieces, so it works with the current rsl-rl releases.
++
++The exported graph has two inputs and seven outputs::
++
++    inputs : obs (1, obs_dim), time_step (1, 1)
++    outputs: actions, joint_pos, joint_vel, body_pos_w, body_quat_w, body_lin_vel_w, body_ang_vel_w
++
++``time_step`` indexes the reference motion, so a deployment runtime can either drive the policy with
++its own observations or replay the reference trajectory that ships inside the same ONNX file.
++"""
++
++import copy
+ import os
++
+ import torch
+ 
+-import onnx
++# Motion tensors are large and are not regenerated at runtime, so they are stored as buffers with
++# ``persistent=False`` to keep them out of the serialized state dict.
++_MOTION_KEYS = ("joint_pos", "joint_vel", "body_pos_w", "body_quat_w", "body_lin_vel_w", "body_ang_vel_w")
+ 
+-from isaaclab.envs import ManagerBasedRLEnv
+-from isaaclab_rl.rsl_rl.exporter import _OnnxPolicyExporter
+ 
+-from whole_body_tracking.tasks.tracking.mdp import MotionCommand
++class _OnnxMotionPolicyExporter(torch.nn.Module):
++    """Wraps an rsl-rl policy model plus its reference motion into one ONNX-exportable module."""
+ 
++    def __init__(self, env, policy, normalizer=None, verbose: bool = False):
++        """Build the export wrapper.
+ 
+-def export_motion_policy_as_onnx(
+-    env: ManagerBasedRLEnv,
+-    actor_critic: object,
+-    path: str,
+-    normalizer: object | None = None,
+-    filename="policy.onnx",
+-    verbose=False,
+-):
+-    if not os.path.exists(path):
+-        os.makedirs(path, exist_ok=True)
+-    policy_exporter = _OnnxMotionPolicyExporter(env, actor_critic, normalizer, verbose)
+-    policy_exporter.export(path, filename)
++        Args:
++            env: The manager-based environment, used to read the active motion command.
++            policy: The trained policy model (``MLPModel`` on rsl-rl >= 4.0).
++            normalizer: Optional observation normalizer. When ``None`` the policy's own
++                ``obs_normalizer`` is used, which is what the modern model carries.
++            verbose: Whether to print the ONNX export summary.
++        """
++        super().__init__()
++        self.verbose = verbose
++
++        if not hasattr(policy, "mlp"):
++            raise TypeError(
++                f"Unsupported policy type '{type(policy).__name__}': expected an rsl-rl model exposing "
++                "a 'mlp' attribute (rsl-rl >= 4.0 MLPModel). For older actor/critic models use "
++                "isaaclab_rl.rsl_rl.exporter._OnnxPolicyExporter instead."
++            )
++        self.mlp = copy.deepcopy(policy.mlp)
++
++        # Prefer the model's own normalizer; it is part of the trained checkpoint.
++        model_normalizer = getattr(policy, "obs_normalizer", None)
++        chosen = model_normalizer if model_normalizer is not None else normalizer
++        self.obs_normalizer = copy.deepcopy(chosen) if chosen is not None else torch.nn.Identity()
+ 
++        # rsl-rl >= 5.0 keeps the output distribution on the model. Export the deterministic head so
++        # the ONNX graph returns the mean action rather than a sample.
++        distribution = getattr(policy, "distribution", None)
++        if distribution is not None and hasattr(distribution, "as_deterministic_output_module"):
++            self.deterministic_output = copy.deepcopy(distribution.as_deterministic_output_module())
++        else:
++            self.deterministic_output = torch.nn.Identity()
+ 
+-class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
+-    def __init__(self, env: ManagerBasedRLEnv, actor_critic, normalizer=None, verbose=False):
+-        super().__init__(actor_critic, normalizer, verbose)
+-        cmd: MotionCommand = env.command_manager.get_term("motion")
++        obs_dim = getattr(policy, "obs_dim", None)
++        if obs_dim is None:
++            obs_dim = self._infer_obs_dim(self.obs_normalizer, self.mlp)
++        self.obs_dim = int(obs_dim)
+ 
+-        self.joint_pos = cmd.motion.joint_pos.to("cpu")
+-        self.joint_vel = cmd.motion.joint_vel.to("cpu")
+-        self.body_pos_w = cmd.motion.body_pos_w.to("cpu")
+-        self.body_quat_w = cmd.motion.body_quat_w.to("cpu")
+-        self.body_lin_vel_w = cmd.motion.body_lin_vel_w.to("cpu")
+-        self.body_ang_vel_w = cmd.motion.body_ang_vel_w.to("cpu")
+-        self.time_step_total = self.joint_pos.shape[0]
++        # Reference motion, read from the active command term and kept on the CPU for export.
++        cmd = env.command_manager.get_term("motion")
++        motion = cmd.motion
++        motion_tensors = {
++            "joint_pos": motion.joint_pos,
++            "joint_vel": motion.joint_vel,
++            "body_pos_w": motion.body_pos_w,
++            "body_quat_w": motion.body_quat_w,
++            "body_lin_vel_w": motion.body_lin_vel_w,
++            "body_ang_vel_w": motion.body_ang_vel_w,
++        }
++        for name in _MOTION_KEYS:
++            tensor = motion_tensors[name]
++            # ``body_*`` properties are already body-indexed; ``joint_*`` are not.
++            self.register_buffer(name, tensor.detach().to("cpu").to(torch.float32), persistent=False)
++        self.time_step_total = int(self.joint_pos.shape[0])
+ 
+-    def forward(self, x, time_step):
+-        time_step_clamped = torch.clamp(time_step.long().squeeze(-1), max=self.time_step_total - 1)
++    @staticmethod
++    def _infer_obs_dim(normalizer, mlp) -> int:
++        """Best-effort recovery of the observation dimension for the dummy input."""
++        for candidate in (getattr(normalizer, "mean", None), getattr(normalizer, "_mean", None)):
++            if candidate is not None:
++                return int(candidate.shape[-1])
++        first = mlp[0] if isinstance(mlp, torch.nn.Sequential) else None
++        if first is not None and hasattr(first, "in_features"):
++            return int(first.in_features)
++        raise ValueError("Could not infer the observation dimension; pass a policy exposing 'obs_dim'.")
++
++    def forward(self, obs: torch.Tensor, time_step: torch.Tensor):
++        """Run deterministic inference and return the action plus the indexed reference motion."""
++        normalized = self.obs_normalizer(obs)
++        actions = self.deterministic_output(self.mlp(normalized))
++
++        step = torch.clamp(time_step.long().squeeze(-1), max=self.time_step_total - 1)
+         return (
+-            self.actor(self.normalizer(x)),
+-            self.joint_pos[time_step_clamped],
+-            self.joint_vel[time_step_clamped],
+-            self.body_pos_w[time_step_clamped],
+-            self.body_quat_w[time_step_clamped],
+-            self.body_lin_vel_w[time_step_clamped],
+-            self.body_ang_vel_w[time_step_clamped],
++            actions,
++            self.joint_pos[step],
++            self.joint_vel[step],
++            self.body_pos_w[step],
++            self.body_quat_w[step],
++            self.body_lin_vel_w[step],
++            self.body_ang_vel_w[step],
+         )
+ 
+-    def export(self, path, filename):
++    def export(self, path: str, filename: str = "policy.onnx") -> str:
++        """Write the ONNX file and return its path.
++
++        Args:
++            path: Destination directory (created when missing).
++            filename: Output file name.
++
++        Returns:
++            The absolute path of the written ONNX file.
++        """
++        os.makedirs(path, exist_ok=True)
++        out_path = os.path.join(path, filename)
+         self.to("cpu")
+-        obs = torch.zeros(1, self.actor[0].in_features)
++        self.eval()
++        obs = torch.zeros(1, self.obs_dim)
+         time_step = torch.zeros(1, 1)
+         torch.onnx.export(
+             self,
+             (obs, time_step),
+-            os.path.join(path, filename),
++            out_path,
+             export_params=True,
+-            opset_version=11,
++            opset_version=18,
+             verbose=self.verbose,
+             input_names=["obs", "time_step"],
+             output_names=[
+@@ -76,17 +153,57 @@ class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
+             ],
+             dynamic_axes={},
+         )
++        return out_path
++
++
++def export_motion_policy_as_onnx(
++    env,
++    policy: object,
++    path: str,
++    normalizer: object | None = None,
++    filename: str = "policy.onnx",
++    verbose: bool = False,
++) -> str:
++    """Export a tracking policy plus its reference motion into a single ONNX file.
++
++    Args:
++        env: The manager-based environment owning the motion command.
++        policy: The trained policy model (``MLPModel`` on rsl-rl >= 4.0).
++        path: Destination directory.
++        normalizer: Optional observation normalizer; the policy's own is preferred.
++        filename: Output file name.
++        verbose: Whether to print the ONNX export summary.
++
++    Returns:
++        The absolute path of the written ONNX file.
++    """
++    if not os.path.exists(path):
++        os.makedirs(path, exist_ok=True)
++    exporter = _OnnxMotionPolicyExporter(env, policy, normalizer, verbose)
++    return exporter.export(path, filename)
+ 
+ 
+ def list_to_csv_str(arr, *, decimals: int = 3, delimiter: str = ",") -> str:
++    """Format an iterable as a delimiter-separated string for ONNX metadata."""
+     fmt = f"{{:.{decimals}f}}"
+     return delimiter.join(
+         fmt.format(x) if isinstance(x, (int, float)) else str(x) for x in arr  # numbers → format, strings → as-is
+     )
+ 
+ 
+-def attach_onnx_metadata(env: ManagerBasedRLEnv, run_path: str, path: str, filename="policy.onnx") -> None:
++def attach_onnx_metadata(env, run_path: str, path: str, filename="policy.onnx") -> None:
++    """Attach the deployment contract (joint order, gains, scales) to an exported ONNX file.
++
++    Args:
++        env: The manager-based environment the policy was exported from.
++        run_path: Identifier of the training run, recorded for provenance.
++        path: Directory containing the ONNX file.
++        filename: ONNX file name.
++    """
++    import onnx
++
+     onnx_path = os.path.join(path, filename)
++    robot = env.scene["robot"]
+ 
+     observation_names = env.observation_manager.active_terms["policy"]
+     observation_history_lengths: list[int] = []
+@@ -99,12 +216,17 @@ def attach_onnx_metadata(env: ManagerBasedRLEnv, run_path: str, path: str, filen
+             history_length = term_cfg["history_length"]
+             observation_history_lengths.append(1 if history_length == 0 else history_length)
+ 
++    # Isaac Lab 3.0 removed ``ArticulationData.default_joint_pos_nominal``. The calibration offset that
++    # the startup term used to stash there is small (|theta| <= 0.01 rad by default), so the authored
++    # default joint positions are used directly; deployment tolerates that offset.
++    default_joint_pos = robot.data.default_joint_pos.torch[0].cpu().tolist()
++
+     metadata = {
+         "run_path": run_path,
+-        "joint_names": env.scene["robot"].data.joint_names,
+-        "joint_stiffness": env.scene["robot"].data.joint_stiffness[0].cpu().tolist(),
+-        "joint_damping": env.scene["robot"].data.joint_damping[0].cpu().tolist(),
+-        "default_joint_pos": env.scene["robot"].data.default_joint_pos_nominal.cpu().tolist(),
++        "joint_names": robot.data.joint_names,
++        "joint_stiffness": robot.data.joint_stiffness.torch[0].cpu().tolist(),
++        "joint_damping": robot.data.joint_damping.torch[0].cpu().tolist(),
++        "default_joint_pos": default_joint_pos,
+         "command_names": env.command_manager.active_terms,
+         "observation_names": observation_names,
+         "observation_history_lengths": observation_history_lengths,
+@@ -114,11 +236,46 @@ def attach_onnx_metadata(env: ManagerBasedRLEnv, run_path: str, path: str, filen
+     }
+ 
+     model = onnx.load(onnx_path)
+-
+     for k, v in metadata.items():
+         entry = onnx.StringStringEntryProto()
+         entry.key = k
+         entry.value = list_to_csv_str(v) if isinstance(v, list) else str(v)
+         model.metadata_props.append(entry)
+-
+     onnx.save(model, onnx_path)
++
++
++def upload_to_wandb(onnx_path: str, run_path: str | None = None, artifact_name: str = "motion_policy") -> None:
++    """Upload an exported ONNX policy to Weights & Biases.
++
++    Models upload as a run artifact (``wandb.save``) and, when ``run_path`` identifies a run, get
++    linked to it so the export is discoverable from the training run.
++
++    ``torch.onnx.export`` stores weights in an external data file (``<name>.onnx.data``) once the
++    model exceeds the inline size limit. That sibling file is *not* picked up by
++    ``Artifact.add_file`` on its own, and an artifact holding only the ``.onnx`` graph fails to load,
++    so every ``<name>.onnx*`` sibling is added explicitly.
++
++    Args:
++        onnx_path: Path of the ONNX file to upload.
++        run_path: Optional W&B run identifier (``entity/project/run_id``) used for provenance.
++        artifact_name: Name of the uploaded artifact.
++    """
++    import glob
++
++    import wandb
++
++    if wandb.run is None:
++        raise RuntimeError(
++            "No active W&B run. Call this from a context where wandb.init() has run, or pass "
++            "WANDB_MODE=offline / set up credentials first."
++        )
++    wandb.save(onnx_path, base_path=os.path.dirname(onnx_path))
++
++    # ``policy.onnx`` also matches ``policy.onnx.data``, which is exactly the sibling set needed.
++    artifact = wandb.Artifact(name=artifact_name, type="model")
++    for sibling in sorted(glob.glob(f"{onnx_path}*")):
++        artifact.add_file(sibling)
++    wandb.run.log_artifact(artifact)
++
++    if run_path:
++        wandb.run.config.update({"exported_from_run": run_path})

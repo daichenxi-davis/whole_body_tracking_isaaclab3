@@ -1,0 +1,42 @@
+# Upstream project (clone it yourself; not vendored here)
+whole_body_tracking/
+IsaacLab/
+
+# Robot description assets — download the tarball per README, do not commit
+unitree_description/
+*.tar.gz
+*.crdownload
+
+# Generated motion data and exports
+motions/
+*.npz
+*.onnx
+*.onnx.data
+
+# Training output
+logs/
+wandb/
+outputs/
+*.pt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Patch/apply scratch
+*.orig
+*.rej

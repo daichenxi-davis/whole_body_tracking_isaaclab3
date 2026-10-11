@@ -1,0 +1,24 @@
+# Normalize line endings so patches, scripts, and diffs behave identically on Windows and Linux.
+* text=auto eol=lf
+
+# Patch files must keep LF: git apply is strict about line endings, and a CRLF-converted patch
+# can silently fail to apply.
+*.patch text eol=lf
+*.diff text eol=lf
+
+# Python sources: normalise to LF on commit, check out as LF everywhere. This matters because the
+# upstream project is Linux-targeted.
+*.py text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+
+# Binary assets
+*.png binary
+*.jpg binary
+*.npz binary
+*.pt binary
+*.onnx binary
+*.data binary
