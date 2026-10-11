@@ -33,8 +33,9 @@ Everything below was executed on Windows 11 / NVIDIA T1200 (4 GB VRAM) / Isaac S
 | Quaternion WXYZ→XYZW (code + data) | ✅ verified, legacy `.npz` loads identically |
 | Capsule collision restoration | ✅ both variants train, `exit 0` |
 | Motion ONNX export | ✅ `ALL CHECKS PASSED` |
-| W&B upload | ✅ verified offline (including external-weight fix) |
-| W&B upload to cloud | ❌ needs credentials |
+| W&B export upload (offline) | ✅ verified, including external-weight fix |
+| W&B training logger | ⚠️ works only with **`wandb<0.29`** — see [Weights & Biases setup](#weights--biases-setup) |
+| W&B upload to cloud | ❌ not run — needs credentials |
 | `--checkpoint latest` / `best` | ✅ verified (a wrapper bug was found and fixed) |
 | Real LAFAN1 training data | ❌ absent — only a synthetic stand-still clip |
 
@@ -116,6 +117,145 @@ Also note: **`--headless` no longer exists** in 3.0 (the parser rejects it). Use
    ```powershell
    python <this-repo>\scripts\make_capsule_urdf.py
    ```
+
+---
+
+## Weights & Biases setup
+
+### ⚠️ Pin `wandb<0.29` first
+
+Isaac Lab 3.0's `announce_new_run` calls `wandb.util.generate_id()`, but **wandb removed that symbol
+in 0.29.0**, so `--logger wandb` crashes before training starts:
+
+```
+File ".../isaaclab_rl/utils/wandb.py", line 107, in announce_new_run
+    os.environ["WANDB_RUN_ID"] = wandb.util.generate_id()
+AttributeError: module 'wandb.util' has no attribute 'generate_id'
+```
+
+Isaac Lab declares `wandb>=0.13.11` with no upper bound, so a current wandb resolves in and breaks it.
+Bisected removal point:
+
+| wandb | `wandb.util.generate_id` |
+|---|---|
+| ≤ 0.28.0 | present |
+| **0.29.0** | **removed** |
+| 0.30.0 | removed |
+
+`wandb.sdk.lib.runid.generate_id` still exists — only the `wandb.util` alias is gone.
+
+Fix by pinning:
+
+```powershell
+uv pip install --python <IsaacLab>\.venv\Scripts\python.exe "wandb==0.28.0"
+```
+
+Two alternatives if you need a current wandb:
+
+- **Pre-set `WANDB_RUN_ID`.** `announce_new_run` only generates an id when the variable is unset, so
+  setting it skips the failing call. You then own the run id — which is also what
+  `--checkpoint wandb:...` needs:
+
+  ```powershell
+  $env:WANDB_RUN_ID = [guid]::NewGuid().ToString().Replace('-','').Substring(0,8)
+  ```
+
+- **Patch the framework:** `wandb.util.generate_id()` → `wandb.sdk.lib.runid.generate_id()`. This is
+  an Isaac Lab change and must be reapplied on every upgrade, which is why pinning is preferred here.
+
+### Entity goes in `WANDB_USERNAME`, not `WANDB_ENTITY`
+
+The two code paths disagree:
+
+| Location | Environment variable read |
+|---|---|
+| `resolve_wandb_entity` (prints the resume hint) | `WANDB_ENTITY` **or** `WANDB_USERNAME` |
+| `WandbLogWriter` (the actual `wandb.init`) | **only `WANDB_USERNAME`** |
+
+Setting only `WANDB_ENTITY` makes the printed hint correct while the run silently lands under your
+default entity. **Use `WANDB_USERNAME`** — both paths read it.
+
+### Remote run
+
+```powershell
+cd <IsaacLab>
+$env:PYTHONIOENCODING="utf-8"; $env:PYTHONUTF8="1"
+
+$env:WANDB_API_KEY="<your API key>"       # or run `wandb login` and omit this line
+$env:WANDB_USERNAME="<your entity>"        # account or team
+Remove-Item Env:\WANDB_MODE -ErrorAction SilentlyContinue   # ensure it is not offline
+
+.venv\Scripts\python.exe -m isaaclab train --rl_library rsl_rl `
+  --task Tracking-Flat-G1-v0 `
+  --external_callback whole_body_tracking.tasks.register.register `
+  --num_envs 64 --max_iterations 30000 `
+  --logger wandb `
+  --log_project_name wbt-g1-tracking `
+  --run_name first-run `
+  --visualizer newton_gl physics=isaacsim_physx `
+  "env.commands.motion.motion_file=<motion.npz>"
+```
+
+Verify with a short run first (`--num_envs 4 --max_iterations 2`, a few tens of seconds). Success looks
+like:
+
+```
+[INFO] Logging to wandb project 'wbt-g1-tracking', run id 'xxxxxxxx'.
+[INFO] Once your entity is known, resume or play it with: --checkpoint wandb:<entity>/wbt-g1-tracking/xxxxxxxx
+```
+
+**Keep that run id** — it is how you resume or play the run later.
+
+### Offline run (no credentials, no network)
+
+```powershell
+$env:WANDB_MODE="offline"
+# same command as above
+```
+
+Artifacts land in `<repo>\wandb\offline-run-*/`. Push them later with:
+
+```powershell
+wandb sync <repo>\wandb\offline-run-*
+```
+
+### CLI mapping
+
+| Flag | Maps to | Notes |
+|---|---|---|
+| `--logger wandb` | `agent_cfg.logger` | choices: `{wandb, tensorboard, neptune}`; default `tensorboard` |
+| `--log_project_name X` | `agent_cfg.wandb_project` **and** `neptune_project` | only applied when the logger is wandb/neptune; defaults to `isaaclab` |
+| `--run_name Y` | `agent_cfg.run_name` | a **log-directory suffix**, not the W&B run name — that becomes `{timestamp}_{Y}` |
+
+Entity and credentials are environment-only; there is no CLI flag for either.
+
+### Resuming and playing from W&B
+
+```powershell
+--checkpoint wandb:<entity>/<project>/<run_id>
+# specific iteration:  ...?checkpoint=500
+```
+
+### What the logger gives you
+
+`WandbLogWriter` subclasses TensorBoard's `SummaryWriter`, so every scalar that reaches TensorBoard
+also reaches W&B (`Loss/*`, `Episode/*`, `Policy/mean_std`, `Perf/*`), and `save_model` uploads each
+checkpoint automatically.
+
+### What is gone from upstream
+
+| Upstream W&B feature | Status |
+|---|---|
+| `--logger wandb`, `--log_project_name` | ✅ present |
+| Automatic metric + checkpoint upload | ✅ present |
+| `--checkpoint wandb:<entity>/<project>/<run_id>` | ✅ present |
+| `--wandb_path` | 🔄 renamed to the `--checkpoint wandb:...` form |
+| `--registry_name` (motion from a W&B artifact registry) | ❌ removed, no replacement |
+| `wandb.run.use_artifact(...)` (link run to motion artifact) | ❌ removed, no replacement |
+| Motion ONNX export + upload on every checkpoint | ❌ lost → use `scripts/export_policy.py` |
+
+Note also that `announce_new_run` **forces** `WANDB_RUN_ID` on first launch (unless you pre-set it),
+so run ids are generated for you rather than chosen.
 
 ---
 

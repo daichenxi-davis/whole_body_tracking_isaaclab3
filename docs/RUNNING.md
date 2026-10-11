@@ -71,11 +71,33 @@ TensorBoard event files, and `git/<repo>.diff`.
 
 ### W&B logging
 
+> **Required: `wandb<0.29`.** Isaac Lab 3.0's `announce_new_run` calls `wandb.util.generate_id()`,
+> which wandb removed in 0.29.0, so `--logger wandb` aborts with
+> `AttributeError: module 'wandb.util' has no attribute 'generate_id'`.
+> Fix: `uv pip install --python <IsaacLab>\.venv\Scripts\python.exe "wandb==0.28.0"`.
+> Full explanation and two alternatives: README → *Weights & Biases setup*.
+
 ```powershell
-$env:WANDB_API_KEY="..."     # or run: wandb login
+# entity: use WANDB_USERNAME. WandbLogWriter does not read WANDB_ENTITY, even though the
+# resume-hint printer does.
+$env:WANDB_API_KEY="..."          # or run: wandb login
+$env:WANDB_USERNAME="<entity>"    # account or team
+Remove-Item Env:\WANDB_MODE -ErrorAction SilentlyContinue   # for an offline run, set it to "offline"
+
 & $PY -m isaaclab train --rl_library rsl_rl ... `
   --logger wandb --log_project_name <project> --run_name <run>
 ```
+
+Offline (no credentials, no network):
+
+```powershell
+$env:WANDB_MODE="offline"
+# same command; artifacts land in <repo>\wandb\offline-run-*/ and can be pushed later with
+wandb sync <repo>\wandb\offline-run-*
+```
+
+`--run_name` is a log-directory **suffix**; the W&B run name becomes `{timestamp}_{run}`. The printer
+emits the generated run id, which is what `--checkpoint wandb:<entity>/<project>/<run_id>` needs later.
 
 `WandbLogWriter` subclasses TensorBoard's writer, so every scalar that reaches TensorBoard also
 reaches W&B, and each checkpoint is uploaded automatically by `save_model`.
@@ -260,6 +282,7 @@ conversion — `MotionLoader` detects the quaternion order.
 | `unrecognized arguments: --headless` | Removed in 3.0. Use `--visualizer none`. |
 | `No module named pip` | The venv is uv-managed. Use `uv pip install`, not `python -m pip`. |
 | Task not found / `gym.error.NameNotFound` | Missing `--external_callback`. |
+| `AttributeError: module 'wandb.util' has no attribute 'generate_id'` | wandb ≥ 0.29 removed the symbol Isaac Lab 3.0 calls. Pin `wandb==0.28.0`, or pre-set `WANDB_RUN_ID`. |
 | `No compatible manifested run with a checkpoint` | `latest`/`best` see no compatible run. The run must have a `run.json` written by the unified entrypoint, and a custom resolver must pass `normalize_task_name(task)` and the agent entry point as metadata. |
 | `AttributeError: 'SimulationCfg' object has no attribute 'physx'` | Patch not applied, or you re-added `self.sim.physx`. Use `self.sim.physics`. |
 | `TypeError: MLPModel.__init__() got an unexpected keyword argument 'stochastic'` | Exporting a checkpoint trained with the deprecated `policy=` config. `export_policy.py` normalizes this; a custom script must call `handle_deprecated_rsl_rl_cfg`. |

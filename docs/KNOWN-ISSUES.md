@@ -87,6 +87,50 @@ now globs `<onnx_path>*`.
 
 ---
 
+## 5b. `--logger wandb` requires `wandb<0.29` (Isaac Lab 3.0 / wandb incompatibility)
+
+Isaac Lab 3.0's `announce_new_run` (`isaaclab_rl/utils/wandb.py:107`) calls `wandb.util.generate_id()`.
+**wandb removed that symbol in 0.29.0**, so enabling the W&B logger aborts before training starts:
+
+```
+AttributeError: module 'wandb.util' has no attribute 'generate_id'
+```
+
+Bisected removal point:
+
+| wandb | `wandb.util.generate_id` |
+|---|---|
+| ≤ 0.28.0 | present |
+| **0.29.0** | **removed** |
+| 0.30.0 | removed |
+
+`wandb.sdk.lib.runid.generate_id` still exists; only the `wandb.util` alias is gone. Isaac Lab declares
+`wandb>=0.13.11` with no upper bound, so a current release resolves in and breaks the logger.
+
+**This is a framework/dependency gap, not a project issue** — upstream never required W&B in a way
+that touched this path. Three options, in order of preference:
+
+1. **Pin the dependency:** `uv pip install ... "wandb==0.28.0"`. No code changes.
+2. **Pre-set `WANDB_RUN_ID`:** `announce_new_run` only generates an id when the variable is unset, so
+   setting it skips the failing branch. Costs you auto-generated run ids, but that id is also what
+   `--checkpoint wandb:...` needs, so owning it is not a real loss.
+3. **Patch Isaac Lab:** `wandb.util.generate_id()` → `wandb.sdk.lib.runid.generate_id()`. Requires
+   reapplying on every framework upgrade, which is why pinning is preferred.
+
+This repository pins option 1 in the environment, and README documents all three.
+
+### Related: entity must be set via `WANDB_USERNAME`, not `WANDB_ENTITY`
+
+| Location | Variable read |
+|---|---|
+| `resolve_wandb_entity` (prints the resume hint) | `WANDB_ENTITY` or `WANDB_USERNAME` |
+| `WandbLogWriter` (the real `wandb.init`) | **only `WANDB_USERNAME`** |
+
+Setting only `WANDB_ENTITY` makes the printed hint correct while the run silently lands under the
+default entity. Use `WANDB_USERNAME`.
+
+---
+
 ## 6. rsl_rl 2.x → 5.5.1 was not diffed at the library level
 
 `check_agent_cfg_equivalence.py` proves that *this project's* agent configuration migrates to
