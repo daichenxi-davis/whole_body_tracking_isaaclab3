@@ -14,10 +14,24 @@ This is a **patch repository**, not a fork — it never duplicates upstream sour
 patches/isaaclab3-migration.patch   the code adaptation (13 files, +488 −184)
 scripts/                            standalone tools
 tools/run_full_chain.ps1            13-step end-to-end harness with per-step timeouts
+docs/VERIFICATION.md                the evidence behind every claim in this README
 docs/RUNNING.md                     full runbook — start here
-docs/MIGRATION.md                   what changed and why
-docs/KNOWN-ISSUES.md                what is broken and what was never tested
+docs/MIGRATION.md                   what changed and why, file by file
+docs/KNOWN-ISSUES.md                what is broken, what was never tested, corrected misdiagnoses
+CHANGELOG.md                        the order things were found and fixed in
+LICENSE                             MIT, with an explicit scope note
 ```
+
+### Where to look for what
+
+| you want to… | read |
+|---|---|
+| install and train | [docs/RUNNING.md](docs/RUNNING.md) |
+| know exactly what the patch changes | [docs/MIGRATION.md](docs/MIGRATION.md) |
+| know what is broken or unverified | [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md) |
+| check a claim in the status table | [docs/VERIFICATION.md](docs/VERIFICATION.md) |
+| see how a bug was found and fixed | [CHANGELOG.md](CHANGELOG.md) |
+| reproduce everything at once | `tools/run_full_chain.ps1` |
 
 ---
 
