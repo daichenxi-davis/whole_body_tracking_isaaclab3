@@ -159,17 +159,22 @@ Measured with an instrumented run of the full play sequence (2 envs, explicit ch
 | `get_observations` | 0.00 s |
 | **first `env.step`** | **raises** |
 
+That instrumentation passed `log_dir=None`, which skips the runner's logger. Through
+`isaaclab play` the logger *is* constructed, and the failure is slower to surface: the log reaches
+`[3/3] Loading policy` and then stops, with no traceback, for well over 120 s. Both endings are the
+same underlying fault — the process does not exit, so the error is reported late or not at all.
+
 Two earlier misdiagnoses are worth recording, because both cost real time:
 
 1. **"Play hangs at policy loading."** It does not hang at loading. The error surfaces there, and the
    process then blocks in teardown — so the symptom looks like a hang with no traceback. Reading the
-   last log lines is not enough; the harness now treats "timed out *after* the success markers" as a
-   distinct, reported outcome rather than a failure.
+   last log lines is not enough; the harness now distinguishes "timed out with the expected output
+   present" from "timed out with output missing".
 2. **"`create_rsl_rl_runner` hangs."** A diagnostic script reported this because it called
    `create_rsl_rl_runner` **without** `handle_deprecated_rsl_rl_cfg` first, reproducing
-   `TypeError: MLPModel.__init__() got an unexpected keyword argument 'stochastic'` already covered in
-   item 8's sibling section. The real play entrypoint *does* call it (`play_rsl_rl.py:113`). With the
-   normalisation applied, runner creation takes 0.02 s.
+   `TypeError: MLPModel.__init__() got an unexpected keyword argument 'stochastic'`. The real play
+   entrypoint *does* call it (`play_rsl_rl.py:113`). With the normalisation applied, runner creation
+   takes 0.02 s.
 
 **Anything you write that constructs an rsl_rl runner from a task config must call
 `handle_deprecated_rsl_rl_cfg(agent_cfg, check_rsl_rl_version())` first.** The raw resolved config

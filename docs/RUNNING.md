@@ -282,11 +282,37 @@ conversion — `MotionLoader` detects the quaternion order.
 | `unrecognized arguments: --headless` | Removed in 3.0. Use `--visualizer none`. |
 | `No module named pip` | The venv is uv-managed. Use `uv pip install`, not `python -m pip`. |
 | Task not found / `gym.error.NameNotFound` | Missing `--external_callback`. |
-| `AttributeError: module 'wandb.util' has no attribute 'generate_id'` | wandb ≥ 0.29 removed the symbol Isaac Lab 3.0 calls. Pin `wandb==0.28.0`, or pre-set `WANDB_RUN_ID`. |
 | `No compatible manifested run with a checkpoint` | `latest`/`best` see no compatible run. The run must have a `run.json` written by the unified entrypoint, and a custom resolver must pass `normalize_task_name(task)` and the agent entry point as metadata. |
+| `AttributeError: module 'wandb.util' has no attribute 'generate_id'` | wandb ≥ 0.29 removed the symbol Isaac Lab 3.0 calls. Pin `wandb==0.28.0`, or pre-set `WANDB_RUN_ID`. |
+| `RuntimeError: Can't get __cuda_array_interface__ on Variable that requires grad` | `isaaclab play` stepping in inference mode. Framework/rsl-rl interaction; see KNOWN-ISSUES §5c. Training and export are unaffected. |
 | `AttributeError: 'SimulationCfg' object has no attribute 'physx'` | Patch not applied, or you re-added `self.sim.physx`. Use `self.sim.physics`. |
-| `TypeError: MLPModel.__init__() got an unexpected keyword argument 'stochastic'` | Exporting a checkpoint trained with the deprecated `policy=` config. `export_policy.py` normalizes this; a custom script must call `handle_deprecated_rsl_rl_cfg`. |
+| `TypeError: MLPModel.__init__() got an unexpected keyword argument 'stochastic'` | The agent config was not normalised. Always pass it through `handle_deprecated_rsl_rl_cfg(agent_cfg, check_rsl_rl_version())` before building a runner — the raw resolved config carries `stochastic` / `init_noise_std` / `noise_std_type` / `state_dependent_std` as `{}`. |
 | `FileNotFoundError: Required asset is missing` | Assets not extracted. The error prints the exact `curl` command. |
+| `[ERROR] URDF not found` from `make_capsule_urdf.py` | It could not locate the G1 URDF. Pass `--urdf <path>` or set `WBT_SOURCE`; the error lists every path it tried. |
 | `fatal: detected dubious ownership` | `git config --global --add safe.directory <path>`. |
 | Empty physics, robot falls through the floor | `sim.physics` unset — see the `physics=` note in section 1. |
 | ONNX export loads but inference is nonsense | `policy.onnx.data` was not shipped with `policy.onnx`. |
+| A training run with `--logger wandb` never exits | Known: wandb teardown blocks after training completes. Checkpoints and the offline run directory are already written. Bound the run externally. |
+
+---
+
+## 8. Run the whole chain at once
+
+`tools/run_full_chain.ps1` executes every command in this document in sequence and reports pass/fail
+per step:
+
+```powershell
+powershell -File <this-repo>\tools\run_full_chain.ps1 `
+  -IL $IL -WBT $WBT -Repo <this-repo>
+```
+
+13 steps, measured **13/13 PASS in 98 s** on the reference machine. Per-step logs land in
+`%TEMP%\wbt_fullchain\logs\` and a machine-readable summary in `%TEMP%\wbt_fullchain\results.json`.
+
+Two steps do not exit on their own — training with `--logger wandb` and `isaaclab play` both block in
+teardown. The harness stops them as soon as their success markers appear and reports
+`PASS (work complete; process stopped after success markers, teardown does not exit)`. A step that
+times out *without* its expected output is reported as a failure.
+
+Detailed rationale for the harness design (process-based timeouts, `taskkill` instead of
+`Process.Kill($true)`, log-file assertions) is in the README's *How the harness bounds itself*.

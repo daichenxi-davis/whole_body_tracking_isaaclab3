@@ -39,8 +39,15 @@ Everything below was executed on Windows 11 / NVIDIA T1200 (4 GB VRAM) / Isaac S
 | W&B upload to cloud | ❌ not run — needs credentials |
 | `--checkpoint latest` / `best` | ✅ verified (a wrapper bug was found and fixed) |
 | `isaaclab play` end-to-end | ⚠️ fails on the first `env.step` — framework issue, see [KNOWN-ISSUES §5c](docs/KNOWN-ISSUES.md) |
-| Full-chain harness | ✅ `tools/run_full_chain.ps1`, 13 steps, per-step timeouts |
+| Full-chain harness | ✅ **13/13 PASS** in 98 s — `tools/run_full_chain.ps1` |
 | Real LAFAN1 training data | ❌ absent — only a synthetic stand-still clip |
+
+The harness result above is the whole documented workflow executed end to end on the machine described
+above. It is a runnable reproduction, not a claim copied from these notes:
+
+```powershell
+powershell -File tools\run_full_chain.ps1 -IL <IsaacLab> -WBT <whole_body_tracking>
+```
 
 ---
 
@@ -323,11 +330,46 @@ Run everything at once:
 powershell -File tools\run_full_chain.ps1 -IL <IsaacLab> -WBT <whole_body_tracking>
 ```
 
-Each of the 13 steps runs in its own job with a hard wall-clock timeout, writes a per-step log, and
-asserts against that log. Two steps legitimately do not exit — training with `--logger wandb` and
-`isaaclab play` both block in teardown — so they declare success patterns and are reported as
-`PASS (timed out in teardown, after success markers were present)` rather than being counted as
-failures.
+Measured result on the reference machine: **13/13 PASS, 98 s total**.
+
+| step | s | step | s |
+|---|---|---|---|
+| 01 patch applies | 1.6 | 08 train (tensorboard) | 21.1 |
+| 02 environment | 3.0 | 09 train (W&B offline) | 5.7 |
+| 03 assets | 4.6 | 10 export `latest` | 21.1 |
+| 04 config drift | 4.6 | 11 validate ONNX | 1.5 |
+| 05 agent cfg equivalence | 4.6 | 12 W&B artifact upload | 9.1 |
+| 06 synthetic motion | 13.6 | 13 play `latest` | 5.7 |
+| 07 capsule URDF | 1.5 | | |
+
+### How the harness bounds itself
+
+Getting this to terminate reliably took three attempts, because the two teardown-blocking steps
+defeat the obvious approaches. What the harness does now:
+
+- **Each step is a real child process**, not a PowerShell job. `Stop-Job` deadlocks: `--logger wandb`
+  leaves a detached `wandb-core` service, and Stop-Job waits for the whole job process tree to be
+  reaped, so it never returns. Measured: one run sat 10+ minutes with the log frozen.
+- **Termination uses `taskkill /PID <pid> /T /F`**, never `Process.Kill($true)`. That overload is
+  .NET Core 3.0+ only; Windows PowerShell 5.1 has a single parameterless `Kill`, so the call failed
+  with "Cannot find an overload for 'Kill'" and left the simulator running — one leftover process
+  accumulated 550 s of CPU.
+- **Steps stop as soon as their success markers appear in the log** (`-StopWhenLogMatches`), with a
+  short grace period so trailing lines flush. Without this, each of steps 09 and 13 burned its whole
+  300 s timeout; with it they finish in 5.7 s.
+- **A timeout is not automatically a failure.** If the log already satisfies the step's assertions,
+  the work completed and only teardown never exited. That is reported as
+  `PASS (timed out after the expected output appeared; teardown does not exit)`.
+- **Assertions read the step's log file, and the exit code comes from the process.** An earlier
+  version asserted on a captured pipeline variable, which cannot see `Write-Host` output, and never
+  checked the exit code at all — it reported a step that exited 1 as PASS.
+- **A post-step sweep** kills any `python`/`wandb-core` started at or after the step began, so a
+  failed kill cannot leak into the next step. Verified: the process table is empty after a run.
+
+Two PowerShell traps were hit and are worth knowing: `foreach ($name in ...)` silently clobbers a
+case-different `$Name` parameter (variable names are case-insensitive), which made every result row
+report the same step name; and a loop variable named `$name` inside a function that also takes `$Name`
+is the same bug.
 
 ---
 
